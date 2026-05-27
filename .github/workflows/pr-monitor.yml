@@ -1,0 +1,91 @@
+name: Monitor upstream PR
+
+on:
+  schedule:
+    - cron: '0 * * * *'
+  workflow_dispatch:
+
+permissions:
+  issues: write
+  contents: read
+  pull-requests: read
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Monitor commaai/panda PR 2406
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MONITOR_REPO: ${{ github.repository }}
+          TARGET_REPO: commaai/panda
+          TARGET_PR: '2406'
+        run: |
+          set -euo pipefail
+
+          pr_json="$(gh pr view "$TARGET_PR" --repo "$TARGET_REPO" --json url,title,state,mergedAt,closedAt,headRefOid,reviewDecision,statusCheckRollup,comments,latestReviews)"
+          comments_json="$(gh api "repos/$TARGET_REPO/issues/$TARGET_PR/comments")"
+          review_comments_json="$(gh api "repos/$TARGET_REPO/pulls/$TARGET_PR/comments")"
+
+          state="$(jq -r '.state' <<<"$pr_json")"
+          title="$(jq -r '.title' <<<"$pr_json")"
+          url="$(jq -r '.url' <<<"$pr_json")"
+          sha="$(jq -r '.headRefOid' <<<"$pr_json")"
+          review_decision="$(jq -r '.reviewDecision // ""' <<<"$pr_json")"
+          comment_count="$(jq 'length' <<<"$comments_json")"
+          review_comment_count="$(jq 'length' <<<"$review_comments_json")"
+          checks_summary="$(jq -r '[.statusCheckRollup[]? | ((.name // .context // "unknown") + ":" + (.conclusion // .state // .status // "unknown"))] | join(", ")' <<<"$pr_json")"
+          snapshot="state=$state|sha=$sha|review=$review_decision|comments=$comment_count|review_comments=$review_comment_count|checks=$checks_summary"
+
+          issue_title="[Monitor] commaai/panda PR #2406"
+          existing="$(gh issue list --repo "$MONITOR_REPO" --state open --search "$issue_title in:title" --json number,title,body --jq '.[0] // empty')"
+          previous_snapshot=""
+          issue_number=""
+          if [[ -n "$existing" ]]; then
+            issue_number="$(jq -r '.number' <<<"$existing")"
+            previous_snapshot="$(jq -r '.body // ""' <<<"$existing" | sed -n 's/^<!-- snapshot: \(.*\) -->$/\1/p' | head -1)"
+          fi
+
+          {
+            echo "<!-- snapshot: $snapshot -->"
+            echo "# PR 自动监控报告"
+            echo
+            echo "- 目标 PR: $url"
+            echo "- 标题: $title"
+            echo "- 状态: $state"
+            echo "- Head SHA: $sha"
+            echo "- Review decision: ${review_decision:-无}"
+            echo "- 普通评论数: $comment_count"
+            echo "- Review 评论数: $review_comment_count"
+            echo "- CI/Checks: ${checks_summary:-暂无可见状态}"
+            echo "- 最近检查时间 UTC: $(date -u +'%Y-%m-%d %H:%M:%S')"
+            echo
+            echo "## 中文处理说明"
+            if [[ "$state" == "MERGED" ]]; then
+              echo "PR 已合并。下一步需要检查赏金/付款流程，并准备联系项目方。"
+            elif [[ "$state" == "CLOSED" ]]; then
+              echo "PR 已关闭。需要查看关闭原因，然后复盘并选择下一个任务。"
+            elif [[ "$comment_count" != "0" || "$review_comment_count" != "0" ]]; then
+              echo "PR 有评论或 review comment。需要回到 Codex 让它翻译评论、修改代码并回复维护者。"
+            else
+              echo "暂无维护者评论，继续等待。"
+            fi
+          } > body.md
+
+          if [[ -z "$issue_number" ]]; then
+            gh issue create --repo "$MONITOR_REPO" --title "$issue_title" --body-file body.md
+          else
+            gh issue edit "$issue_number" --repo "$MONITOR_REPO" --body-file body.md
+            if [[ "$previous_snapshot" != "$snapshot" ]]; then
+              {
+                echo "PR 状态发生变化。"
+                echo
+                echo "旧状态: ${previous_snapshot:-无}"
+                echo
+                echo "新状态: $snapshot"
+                echo
+                echo "请把这个评论发给 Codex，它会用中文翻译并处理下一步。"
+              } > comment.md
+              gh issue comment "$issue_number" --repo "$MONITOR_REPO" --body-file comment.md
+            fi
+          fi
